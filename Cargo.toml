@@ -1,6 +1,6 @@
 [package]
 name = "unbing"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Bing's picture of the day as your wallpaper. No telemetry, no account, no tracking."
 license = "MIT"
