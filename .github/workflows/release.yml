@@ -1,0 +1,189 @@
+name: Release
+
+# Releases are made by CI only, never by hand:
+#   - every push to main that passes CI publishes a new patch release,
+#   - Actions tab → Release → Run workflow publishes a minor or major release.
+# The workflow bumps Cargo.toml, commits, tags, builds every platform and
+# publishes the GitHub release with the executables.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: Version bump
+        type: choice
+        options: [patch, minor, major]
+        default: minor
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  LINUX_DEPS: libxkbcommon-dev libwayland-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+
+jobs:
+  prepare:
+    name: Bump version and tag
+    # Automatic run: only after a successful CI on a push to main.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.bump.outputs.tag }}
+    steps:
+      - name: Refuse to release from another branch
+        if: github.event_name == 'workflow_dispatch' && github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::Releases are made from main (got ${GITHUB_REF_NAME})"
+          exit 1
+
+      # Release exactly the commit CI tested.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: github.event_name == 'workflow_dispatch'
+
+      - name: Test before releasing
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
+          cargo test --locked
+
+      - name: Bump, commit and tag
+        id: bump
+        run: |
+          version=$(scripts/bump-version.sh "${{ inputs.bump || 'patch' }}")
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+            echo "::error::Tag $tag already exists"
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release $tag"
+          git tag "$tag"
+          git push origin HEAD:main "$tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Releasing $tag" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: Build ${{ matrix.asset }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset: unbing-macos-universal
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset: unbing-linux-x86_64
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset: unbing-linux-aarch64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: Unbing-windows-x86_64.zip
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y $LINUX_DEPS
+
+      - name: Build (macOS universal + .app)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/unbing-macos-universal \
+            target/aarch64-apple-darwin/release/unbing \
+            target/x86_64-apple-darwin/release/unbing
+          codesign --force --sign - dist/unbing-macos-universal
+
+          version=${TAG#v}
+          app=dist/Unbing.app
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp assets/icon.icns "$app/Contents/Resources/icon.icns"
+          cp dist/unbing-macos-universal "$app/Contents/MacOS/unbing"
+          sed "s/__VERSION__/$version/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          codesign --force --deep --sign - "$app"
+          (cd dist && ditto -c -k --norsrc --keepParent Unbing.app Unbing-macos-universal.zip)
+          rm -rf "$app"
+
+      - name: Build (Linux / Windows)
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+          mkdir -p dist
+          bin=target/${{ matrix.target }}/release/unbing
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            # Unbing.exe is kept for the installer; the portable build is a zip of it.
+            mkdir -p build && cp "$bin.exe" build/Unbing.exe
+          else
+            cp "$bin" "dist/${{ matrix.asset }}"
+          fi
+
+      # Portable zip and the installer.
+      - name: Package Windows (zip + installer)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          Compress-Archive -Path build\Unbing.exe -DestinationPath "dist\${{ matrix.asset }}"
+          $version = $env:TAG.TrimStart('v')
+          & $iscc /Qp "/DAppVersion=$version" "/DSourceExe=$PWD\build\Unbing.exe" "/DOutputDir=$PWD\dist" packaging\windows\unbing.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+
+  publish:
+    name: Publish release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create GitHub release with the executables
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+          gh release create "$TAG" * \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Unbing $TAG" \
+            --generate-notes
