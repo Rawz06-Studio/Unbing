@@ -80,6 +80,9 @@ xattr -dr com.apple.quarantine /Applications/Unbing.app
 The daily change is a LaunchAgent (`~/Library/LaunchAgents/studio.rawz06.unbing.plist`) that starts
 `Unbing --background` at login: menu bar icon only, no window and no Dock icon. It makes no request
 until Bing has published a new picture.
+
+macOS keeps one wallpaper per Space. While the daily change is on, a Space that still shows an older
+Unbing picture gets today's as soon as you switch to it; wallpapers you picked yourself are left alone.
 </details>
 
 <details>

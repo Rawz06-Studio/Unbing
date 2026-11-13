@@ -3,6 +3,7 @@
 //! Network and disk work runs on a worker thread: the UI never blocks.
 
 pub mod icons;
+mod mini;
 mod native;
 pub mod theme;
 pub mod widgets;
@@ -36,8 +37,6 @@ const TOOLBAR_HEIGHT: f32 = 52.0;
 const ICON_PNG: &[u8] = include_bytes!("../../assets/icon-256.png");
 /// Margin after Bing's announced publication time before fetching it.
 const PUBLICATION_MARGIN: i64 = 5 * 60;
-/// Compact window opened from the tray icon.
-const MINI_SIZE: [f32; 2] = [320.0, 464.0];
 
 /// A wallpaper app needs no discrete GPU. By default wgpu asks for the high-performance one,
 /// which on laptops wakes up the dedicated GPU: prefer the integrated one, and on Windows
@@ -122,9 +121,25 @@ struct App {
     background: bool,
     quitting: bool,
     /// Compact window: open, where (logical points), and whether it got focus yet.
-    mini: Option<(egui::Pos2, bool, Instant)>,
+    /// Compact mode (opened from the tray icon): since when, and whether it got focus yet.
+    compact: Option<(Instant, bool)>,
+    /// Main window geometry to restore when leaving compact mode.
+    main_rect: Option<Rect>,
+    /// Traffic lights hidden (macOS, compact mode).
+    buttons_hidden: bool,
+    /// The window still has the compact size and placement.
+    compact_geometry: bool,
+    configured: bool,
+    /// Picture the system actually shows (macOS: current Space of the main screen).
+    system_wallpaper: Option<PathBuf>,
+    last_wallpaper_check: Instant,
+    /// Picture the user set by hand (not re-replaced by today's one until the next day).
+    manual_choice: Option<String>,
+    last_enforce: Instant,
     /// The app was active at the last check (macOS: detects a relaunch from the Finder).
     was_active: bool,
+    /// Last time Unbing activated itself (or started): activations then aren't relaunches.
+    self_activated: Instant,
     menu_rx: Option<Receiver<Action>>,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     tray: Option<crate::tray::Tray>,
@@ -183,8 +198,17 @@ impl App {
             start_hidden: background && has_tray,
             background,
             quitting: false,
-            mini: None,
+            compact: None,
+            main_rect: None,
+            buttons_hidden: false,
+            compact_geometry: false,
+            configured: false,
+            system_wallpaper: None,
+            last_wallpaper_check: Instant::now() - Duration::from_secs(60),
+            manual_choice: None,
+            last_enforce: Instant::now() - Duration::from_secs(60),
             was_active: false,
+            self_activated: Instant::now(),
             menu_rx,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             tray,
@@ -368,6 +392,7 @@ impl App {
         let published = self.due.is_some_and(|due| chrono::Utc::now().timestamp() >= due + PUBLICATION_MARGIN);
         if new_day || published {
             self.day = now;
+            self.manual_choice = None;
             self.due = None;
             self.run(Job::Startup, ctx);
             if new_day && self.cfg.check_updates && !cfg!(debug_assertions) {
@@ -398,14 +423,23 @@ impl App {
     }
 
     fn is_applied(&self) -> bool {
-        self.current().is_some_and(|img| self.applied_id.as_deref() == Some(img.id().as_str()))
+        self.current().is_some_and(|img| self.shows(&img.id()))
+    }
+
+    /// Is the picture with this id the wallpaper? Asks the system when it can tell
+    /// (the index alone can be wrong: another Space, another app, a manual change…).
+    fn shows(&self, id: &str) -> bool {
+        match &self.system_wallpaper {
+            Some(path) => path.file_name().is_some_and(|f| f.to_string_lossy().starts_with(id)),
+            None => self.applied_id.as_deref() == Some(id),
+        }
     }
 
     fn menu_state(&self) -> menu::Enabled {
         menu::Enabled {
             newer: self.selected > 0,
             older: self.selected + 1 < self.images.len(),
-            apply: self.backend.is_some() && self.current().is_some() && !self.is_applied(),
+            apply: self.backend.is_some() && self.current().is_some(),
         }
     }
 
@@ -414,9 +448,14 @@ impl App {
         match action {
             Action::Newer if state.newer => self.select(self.selected - 1, ctx),
             Action::Older if state.older => self.select(self.selected + 1, ctx),
-            Action::Apply if state.apply => self.run(Job::Apply(self.selected), ctx),
+            Action::Apply if state.apply => {
+                // Chosen by hand: keep it, even if it isn't today's picture.
+                self.manual_choice = self.current().map(BingImage::id).filter(|_| self.selected > 0);
+                self.run(Job::Apply(self.selected), ctx);
+            }
             Action::Today => {
                 self.selected = 0;
+                self.manual_choice = None;
                 if self.backend.is_some() && !self.images.is_empty() {
                     self.run(Job::Apply(0), ctx);
                 }
@@ -442,15 +481,22 @@ impl App {
     }
 
     fn show_window(&mut self, ctx: &egui::Context) {
-        self.mini = None;
+        self.compact = None;
+        if std::mem::take(&mut self.compact_geometry) {
+            self.restore_main_geometry(ctx);
+        }
         self.window_visible = true;
         native::set_dock_icon(true);
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::Focus);
+        self.self_activated = Instant::now();
         native::activate();
     }
 
     fn hide_window(&mut self, ctx: &egui::Context) {
+        if !self.compact_geometry {
+            self.main_rect = ctx.input(|i| i.viewport().outer_rect);
+        }
         self.window_visible = false;
         self.show_settings = false;
         self.show_about = false;
@@ -460,31 +506,86 @@ impl App {
 
     #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     fn toggle_mini(&mut self, ctx: &egui::Context, anchor: Option<crate::tray::Anchor>) {
-        if self.mini.take().is_some() {
+        if self.compact.is_some() {
+            self.leave_compact(ctx);
+            return;
+        }
+        // The full window is open: just bring it forward.
+        if self.window_visible {
+            self.show_window(ctx);
             return;
         }
         let ppp = ctx.input(|i| i.viewport().native_pixels_per_point).unwrap_or(ctx.pixels_per_point());
+        let [w, h] = mini::SIZE;
         let pos = match anchor {
             Some(a) => {
                 let center_x = (a.x + a.width / 2.0) as f32 / ppp;
-                let x = (center_x - MINI_SIZE[0] / 2.0).max(8.0);
+                let x = (center_x - w / 2.0).max(8.0);
                 // Menu bar at the top on macOS; taskbar usually at the bottom on Windows.
                 let below = (a.y as f32 / ppp) < 200.0;
-                let y =
-                    if below { (a.y + a.height) as f32 / ppp + 6.0 } else { a.y as f32 / ppp - MINI_SIZE[1] - 10.0 };
+                let y = if below { (a.y + a.height) as f32 / ppp + 6.0 } else { a.y as f32 / ppp - h - 40.0 };
                 let x = match ctx.input(|i| i.viewport().monitor_size) {
-                    Some(size) => x.min(size.x - MINI_SIZE[0] - 8.0),
+                    Some(size) => x.min(size.x - w - 8.0),
                     None => x,
                 };
                 egui::pos2(x, y.max(0.0))
             }
             None => egui::pos2(80.0, 80.0),
         };
-        self.mini = Some((pos, false, Instant::now()));
+        if !self.compact_geometry {
+            self.main_rect = self.main_rect.or_else(|| ctx.input(|i| i.viewport().outer_rect));
+        }
+        self.compact = Some((Instant::now(), false));
+        self.compact_geometry = true;
+        self.show_settings = false;
+        self.show_about = false;
+        use egui::ViewportCommand as C;
+        let root = egui::ViewportId::ROOT;
+        ctx.send_viewport_cmd_to(root, C::MinInnerSize(vec2(w, h)));
+        ctx.send_viewport_cmd_to(root, C::InnerSize(vec2(w, h)));
+        ctx.send_viewport_cmd_to(root, C::OuterPosition(pos));
+        ctx.send_viewport_cmd_to(root, C::Resizable(false));
+        ctx.send_viewport_cmd_to(root, C::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+        if cfg!(windows) {
+            ctx.send_viewport_cmd_to(root, C::Decorations(false));
+        }
+        ctx.send_viewport_cmd_to(root, C::Visible(true));
+        ctx.send_viewport_cmd_to(root, C::Focus);
+        self.self_activated = Instant::now();
         native::activate();
-        // The main window may be hidden: ask for a full pass so the compact window opens.
-        ctx.send_viewport_cmd_to(egui::ViewportId::ROOT, egui::ViewportCommand::RequestPaintWhileHidden);
         ctx.request_repaint();
+    }
+
+    /// Leaves compact mode by hiding the window (it gets its full size back when shown).
+    fn leave_compact(&mut self, ctx: &egui::Context) {
+        if self.compact.take().is_none() {
+            return;
+        }
+        self.hide_window(ctx);
+        native::deactivate();
+    }
+
+    fn restore_main_geometry(&mut self, ctx: &egui::Context) {
+        use egui::ViewportCommand as C;
+        let root = egui::ViewportId::ROOT;
+        ctx.send_viewport_cmd_to(root, C::WindowLevel(egui::WindowLevel::Normal));
+        ctx.send_viewport_cmd_to(root, C::Resizable(true));
+        if cfg!(windows) {
+            ctx.send_viewport_cmd_to(root, C::Decorations(true));
+        }
+        ctx.send_viewport_cmd_to(root, C::MinInnerSize(vec2(760.0, 480.0)));
+        match self.main_rect {
+            Some(rect) => {
+                ctx.send_viewport_cmd_to(root, C::InnerSize(rect.size()));
+                ctx.send_viewport_cmd_to(root, C::OuterPosition(rect.min));
+            }
+            None => {
+                ctx.send_viewport_cmd_to(root, C::InnerSize(vec2(1000.0, 640.0)));
+                if let Some(size) = ctx.input(|i| i.viewport().monitor_size) {
+                    ctx.send_viewport_cmd_to(root, C::OuterPosition(((size - vec2(1000.0, 640.0)) / 2.0).to_pos2()));
+                }
+            }
+        }
     }
 
     fn save_config(&mut self) {
@@ -532,7 +633,7 @@ impl App {
                 let id = img.id();
                 let date = img.local_date().map(short_date).unwrap_or_else(|| img.display_date());
                 let title = if img.title.is_empty() { "Untitled" } else { &img.title };
-                let applied = self.applied_id.as_deref() == Some(id.as_str());
+                let applied = self.shows(&id);
                 let resp = w::image_row(ui, self.thumbs.get(&id), &date, title, i == self.selected, applied);
                 if resp.clicked() {
                     clicked = Some(i);
@@ -578,7 +679,11 @@ impl App {
             ui.spacing_mut().item_spacing.x = 6.0;
             let state = self.menu_state();
             if self.is_applied() {
-                w::button(ui, "Current Wallpaper", Some(Icon::Check), false);
+                // Still clickable: the picture may be missing on another Space or screen.
+                let resp = w::button(ui, "Current Wallpaper", Some(Icon::Check), state.apply && !self.busy);
+                if resp.on_hover_text("Set it again").clicked() {
+                    self.act(Action::Apply, &ctx);
+                }
             } else {
                 let hint = if self.backend.is_none() {
                     "No way to change the wallpaper was found on this system"
@@ -739,150 +844,117 @@ impl App {
 
     // ---------- Compact window (tray) ----------
 
-    fn mini_window(&mut self, ctx: &egui::Context) {
-        let Some((pos, had_focus, opened)) = self.mini else { return };
-        let builder = egui::ViewportBuilder::default()
-            .with_title("Unbing")
-            .with_inner_size(MINI_SIZE)
-            .with_position(pos)
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_transparent(true)
-            .with_taskbar(false)
-            .with_window_level(egui::WindowLevel::AlwaysOnTop);
-        let close = ctx.show_viewport_immediate(egui::ViewportId::from_hash_of("mini"), builder, |ui, _| {
-            let p = pal(ui);
-            let frame = Frame::new()
-                .fill(ui.visuals().window_fill)
-                .stroke(Stroke::new(1.0, p.border))
-                .corner_radius(CornerRadius::same(12))
-                .inner_margin(Margin::same(14));
-            egui::CentralPanel::default().frame(Frame::NONE).show(ui, |ui| {
-                frame.show(ui, |ui| {
-                    ui.set_min_size(ui.available_size());
-                    self.mini_content(ui);
-                });
-            });
-            let focused = ui.input(|i| i.viewport().focused);
-            // Ignore focus moves while it opens (the main window may take focus once).
-            let settled = opened.elapsed() > Duration::from_millis(500);
-            if !settled {
-                ui.ctx().request_repaint_after(Duration::from_millis(550));
-            }
-            let lost_focus = had_focus && settled && focused == Some(false);
-            let gained = focused == Some(true);
-            let close = ui.input(|i| i.viewport().close_requested() || i.key_pressed(Key::Escape)) || lost_focus;
-            (close, gained)
-        });
-        let (close, gained) = close;
-        if close {
-            self.mini = None;
-            if !self.window_visible {
-                native::deactivate();
-            }
-        } else if gained && let Some(m) = &mut self.mini {
-            m.1 = true;
+    /// What the compact window shows, refreshed on every pass.
+    fn mini_view(&self) -> mini::MiniView {
+        let img = self.current();
+        let state = self.menu_state();
+        let texture = match &self.preview {
+            Some((_, tex, _)) if self.preview_matches() => Some(tex.clone()),
+            _ => img.and_then(|i| self.thumbs.get(&i.id())).cloned(),
+        };
+        mini::MiniView {
+            texture,
+            loading: self.busy,
+            title: img
+                .map(|i| if i.title.is_empty() { "Untitled".to_owned() } else { i.title.clone() })
+                .unwrap_or_default(),
+            copyright: img.map(|i| i.copyright.clone()).unwrap_or_default(),
+            date: img.and_then(BingImage::local_date).map(short_date).unwrap_or_default(),
+            newer: state.newer,
+            older: state.older,
+            can_apply: state.apply && !self.busy,
+            applied: self.is_applied(),
+            daily: self.autostart,
+            daily_supported: self.backend.is_some(),
+            update: match &self.update {
+                Update::Available(rel) => Some((format!("Update to {}", rel.version), false)),
+                Update::Installed => Some((String::new(), true)),
+                _ => None,
+            },
+            status: match &self.status {
+                Status::Error(e) => (e.clone(), true),
+                _ => (requests_label(self.requests_today), false),
+            },
         }
     }
 
-    fn mini_content(&mut self, ui: &mut egui::Ui) {
-        let p = pal(ui);
+    /// The compact window's content (the main window in compact mode).
+    fn compact_ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        let state = self.menu_state();
-
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("Unbing").size(13.0).strong());
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 0.0;
-                if w::icon_button(ui, Icon::ChevronRight, "Newer picture", state.newer).clicked() {
-                    self.act(Action::Newer, &ctx);
-                }
-                if w::icon_button(ui, Icon::ChevronLeft, "Older picture", state.older).clicked() {
-                    self.act(Action::Older, &ctx);
-                }
-                let date = self.current().and_then(BingImage::local_date).map(short_date).unwrap_or_default();
-                ui.add_space(6.0);
-                ui.label(RichText::new(date).size(12.0).color(p.weak));
-            });
+        let view = self.mini_view();
+        let mut intents = Vec::new();
+        let p = pal(ui);
+        let frame = Frame::new().fill(ui.visuals().window_fill).inner_margin(Margin {
+            left: 14,
+            right: 14,
+            top: if cfg!(target_os = "macos") { 12 } else { 14 },
+            bottom: 14,
         });
-        ui.add_space(6.0);
-
-        let width = ui.available_width();
-        let (rect, _) = ui.allocate_exact_size(vec2(width, width * 9.0 / 16.0), egui::Sense::hover());
-        self.picture(ui, rect, 8);
-        ui.add_space(8.0);
-
-        if let Some(img) = self.current().cloned() {
-            let title = if img.title.is_empty() { "Untitled".to_owned() } else { img.title.clone() };
-            ui.add(egui::Label::new(RichText::new(title).size(13.5).strong().color(p.text)).truncate());
-            ui.add(egui::Label::new(RichText::new(&img.copyright).size(11.0).color(p.weak)).truncate())
-                .on_hover_text(&img.copyright);
-        }
-        ui.add_space(10.0);
-
-        ui.horizontal(|ui| {
-            if self.is_applied() {
-                w::button(ui, "Current Wallpaper", Some(Icon::Check), false);
-            } else if w::accent_button(ui, "Set as Wallpaper", Some(Icon::Display), state.apply).clicked() {
-                self.act(Action::Apply, &ctx);
+        egui::CentralPanel::default().frame(frame).show(ui, |ui| {
+            if cfg!(target_os = "macos") {
+                let top = Rect::from_min_size(ui.max_rect().min, vec2(ui.available_width(), 24.0));
+                w::window_drag_area(ui, top, "compact_drag");
             }
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if self.busy {
-                    ui.spinner();
-                }
-            });
+            mini::content(ui, &view, &mut intents);
         });
-        ui.add_space(8.0);
-        ui.separator();
+        let _ = p;
 
-        ui.horizontal(|ui| {
-            let mut daily = self.autostart;
-            w::checkbox(ui, &mut daily, self.backend.is_some());
-            ui.label("Change wallpaper every day");
-            if daily != self.autostart {
-                self.set_daily(daily);
+        // Close like a menu when it loses focus (ignore focus moves while it opens).
+        let focused = ctx.input(|i| i.viewport().focused);
+        if let Some((opened, had_focus)) = &mut self.compact {
+            let settled = opened.elapsed() > Duration::from_millis(500);
+            if !settled {
+                ctx.request_repaint_after(Duration::from_millis(550));
             }
-        });
-        match &self.update {
-            Update::Available(rel) => {
-                let label = format!("Update to {}", rel.version);
-                if w::button(ui, &label, Some(Icon::Download), true).clicked() {
-                    self.show_window(&ctx);
-                }
+            if focused == Some(true) {
+                *had_focus = true;
             }
-            Update::Installed => {
-                if w::accent_button(ui, "Restart to Update", None, true).clicked() {
-                    self.restart(&ctx);
-                }
-            }
-            _ => {
-                if let Status::Error(e) = &self.status {
-                    let short: String = e.chars().take(48).collect();
-                    ui.label(RichText::new(short).size(11.0).color(p.red)).on_hover_text(e.as_str());
-                } else {
-                    ui.label(RichText::new(requests_label(self.requests_today)).size(11.0).color(p.weak));
-                }
+            if (*had_focus && settled && focused == Some(false)) || ctx.input(|i| i.key_pressed(Key::Escape)) {
+                self.leave_compact(&ctx);
             }
         }
 
-        ui.add_space(6.0);
-        ui.separator();
-        ui.add_space(2.0);
+        for intent in intents {
+            match intent {
+                mini::MiniIntent::Act(a) => self.act(a, &ctx),
+                mini::MiniIntent::SetDaily(on) => self.set_daily(on),
+                mini::MiniIntent::Update => {
+                    if let Update::Available(rel) = &self.update {
+                        match rel.asset_url.clone() {
+                            Some(url) => self.install_update(&ctx, url),
+                            None => ctx.open_url(egui::OpenUrl::new_tab(&rel.page_url)),
+                        }
+                    }
+                }
+                mini::MiniIntent::Restart => self.restart(&ctx),
+            }
+        }
+    }
+
+    /// macOS shows one wallpaper per Space: when the current Space still shows an older
+    /// Unbing picture, put today's there too (pictures the user set by hand are kept).
+    fn follow_wallpaper(&mut self, ctx: &egui::Context) {
+        if self.last_wallpaper_check.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        self.last_wallpaper_check = Instant::now();
+        self.system_wallpaper = native::current_wallpaper();
+        let Some(shown) = &self.system_wallpaper else { return };
+        let Some(today) = self.images.first().map(BingImage::id) else { return };
+        let ours = self.cfg.images_dir().is_ok_and(|dir| shown.starts_with(&dir));
+        let name = shown.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
+        let outdated = ours && !name.starts_with(&today);
+        let kept = self.manual_choice.as_ref().is_some_and(|id| name.starts_with(id.as_str()));
+        if self.autostart
+            && self.cfg.auto_apply
+            && outdated
+            && !kept
+            && !self.busy
+            && self.last_enforce.elapsed() > Duration::from_secs(30)
         {
-            ui.horizontal(|ui| {
-                if w::button(ui, "Open Unbing", None, true).clicked() {
-                    self.show_window(&ctx);
-                }
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if w::button(ui, "Quit", None, true).clicked() {
-                        self.quit(&ctx);
-                    }
-                    if w::icon_button(ui, Icon::Gear, "Settings", true).clicked() {
-                        self.show_window(&ctx);
-                        self.open_window(&ctx, Action::Settings);
-                    }
-                });
-            });
+            tracing::info!("this Space shows an older Unbing picture, setting today's");
+            self.last_enforce = Instant::now();
+            self.run(Job::Apply(0), ctx);
         }
     }
 
@@ -1196,12 +1268,21 @@ impl eframe::App for App {
         for action in actions {
             self.act(action, ctx);
         }
+        self.follow_wallpaper(ctx);
 
         #[cfg(debug_assertions)]
         if let Some(at) = self.debug_mini_at {
             if Instant::now() >= at {
                 self.debug_mini_at = None;
-                self.toggle_mini(ctx, None);
+                if self.compact.is_some() {
+                    self.show_window(ctx);
+                } else {
+                    self.toggle_mini(ctx, None);
+                    // UNBING_DEBUG_REOPEN: then switch to the full window, like "Open Unbing".
+                    if std::env::var("UNBING_DEBUG_REOPEN").is_ok() {
+                        self.debug_mini_at = Some(Instant::now() + Duration::from_secs(3));
+                    }
+                }
             } else {
                 ctx.request_repaint_after(at - Instant::now());
             }
@@ -1209,7 +1290,8 @@ impl eframe::App for App {
 
         // Another launch (Finder, Start menu…) while we run in the background: show the window.
         let active = native::is_active();
-        let reopened = active && !self.was_active && !self.window_visible && self.mini.is_none();
+        let own = self.self_activated.elapsed() < Duration::from_secs(3);
+        let reopened = active && !self.was_active && !own && !self.window_visible && self.compact.is_none();
         self.was_active = active;
         if crate::instance::take_show_request() || reopened {
             self.show_window(ctx);
@@ -1225,10 +1307,25 @@ impl eframe::App for App {
         if std::mem::take(&mut self.start_hidden) {
             self.hide_window(&ctx);
         }
+        if !self.configured {
+            // Window behavior of a menu bar app (macOS), set once the window exists.
+            native::set_window_buttons_hidden(frame, false);
+            self.configured = true;
+        }
         // With a tray icon, closing the window keeps Unbing running in the menu bar.
         if ctx.input(|i| i.viewport().close_requested()) && !self.quitting && self.has_tray() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.hide_window(&ctx);
+        }
+        // No traffic lights on the compact window.
+        let hide_buttons = self.compact.is_some();
+        if hide_buttons != self.buttons_hidden {
+            native::set_window_buttons_hidden(frame, hide_buttons);
+            self.buttons_hidden = hide_buttons;
+        }
+        if self.compact.is_some() {
+            self.compact_ui(ui);
+            return;
         }
 
         // Mica takes the light/dark variant explicitly: re-apply when it changes.
@@ -1278,7 +1375,6 @@ impl eframe::App for App {
         if self.window_visible {
             self.windows(&ctx);
         }
-        self.mini_window(&ctx);
     }
 }
 
