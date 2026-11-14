@@ -13,7 +13,7 @@ use crate::config::Config;
 use crate::sync::{Engine, Progress, today};
 
 /// Largest preview sent to the GPU (no need for a 4K texture).
-const PREVIEW_MAX: (u32, u32) = (1920, 1080);
+const PREVIEW_MAX: (u32, u32) = (2560, 1440);
 /// Sidebar thumbnails (×2 for Retina screens).
 const THUMB_MAX: (u32, u32) = (160, 90);
 /// When the metadata could not be fetched, try again in an hour.
@@ -188,7 +188,7 @@ fn run_job(job: Job, cfg: Config, mut images: Vec<BingImage>, out: &Reporter) {
 
 fn show_cached(engine: &Engine, images: &[BingImage], index: usize, out: &Reporter) {
     let Some(img) = images.get(index) else { return };
-    let Some(path) = engine.cache.lookup(&img.id(), engine.cfg.uhd) else { return };
+    let Some(path) = engine.cache.lookup(&img.id(), engine.cfg.uhd()) else { return };
     match decode(&path) {
         Ok(full) => {
             out.send(Msg::Preview { index, id: img.id(), image: to_color_image(&full, PREVIEW_MAX), path });

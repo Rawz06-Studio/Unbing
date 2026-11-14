@@ -118,13 +118,13 @@ impl Engine {
 
     /// Local path of the picture, downloaded only if it isn't cached.
     pub fn ensure_image(&mut self, img: &BingImage, progress: &mut dyn FnMut(Progress)) -> Result<PathBuf, SyncError> {
-        if let Some(path) = self.cache.lookup(&img.id(), self.cfg.uhd) {
+        if let Some(path) = self.cache.lookup(&img.id(), self.cfg.uhd()) {
             info!("picture already cached: {}", path.display());
             return Ok(path);
         }
         progress(Progress::Downloading(img.title.clone()));
         let day = today();
-        let want_uhd = self.cfg.uhd;
+        let want_uhd = self.cfg.uhd();
         self.cache.count_request(&day);
         let first = self.client.download(&img.image_url(want_uhd)?);
         let (bytes, got_uhd, uhd_unavailable) = match first {

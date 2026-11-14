@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use crate::autostart;
 use crate::bing::{BingImage, MARKETS};
-use crate::config::{Config, MAX_HISTORY, MIN_HISTORY, Theme};
+use crate::config::{Config, MAX_HISTORY, MIN_HISTORY, Resolution, Theme};
 use crate::menu::{self, Action, GITHUB_URL, SHOW_FOLDER};
 use crate::sync::today;
 use crate::updater;
@@ -1051,7 +1051,7 @@ impl App {
             ui.end_row();
 
             ui.label(RichText::new("Resolution").color(p.weak));
-            w::segmented(ui, &mut self.cfg.uhd, &[(false, "1080p"), (true, "4K")]);
+            w::segmented(ui, &mut self.cfg.resolution, &[(Resolution::Uhd, "4K"), (Resolution::Hd, "1080p")]);
             ui.end_row();
 
             ui.label(RichText::new("Wallpaper").color(p.weak));
@@ -1148,6 +1148,14 @@ impl App {
             if self.cfg.market != before.market {
                 self.preview = None;
                 self.run(Job::Refresh, &ctx);
+            } else if self.cfg.resolution != before.resolution {
+                // Fetch the new size; if an Unbing picture is the wallpaper, set it again in that size.
+                self.preview = None;
+                let shown = self.images.iter().position(|img| self.shows(&img.id()));
+                match shown {
+                    Some(i) if self.backend.is_some() => self.run(Job::Apply(i), &ctx),
+                    _ => self.run(Job::Show(self.selected), &ctx),
+                }
             }
         }
     }

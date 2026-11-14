@@ -33,7 +33,7 @@ only to check for its own updates (which you can turn off).
 - **Picture of the day** — downloaded, applied as your wallpaper and kept in `Pictures/Unbing`.
 - **The last 8 days** — browse them in the sidebar, set any of them as wallpaper.
 - **Market** — `fr-FR`, `en-US`, `en-GB`, `de-DE`, `ja-JP`… the picture differs per market.
-- **4K** — optional UHD downloads for high-density screens (falls back to 1080p when a picture has no UHD version).
+- **4K** — pictures in 3840×2160 by default, Bing's largest size (falls back to 1080p when a picture has no UHD version); 1080p available to save bandwidth.
 - **Menu bar / notification area** — a small icon next to the clock (macOS menu bar, Windows notification area) opens a compact window: today's picture, previous/next, set as wallpaper, daily change on/off. Closing the main window keeps Unbing there.
 - **Daily change** — one checkbox registers Unbing to start with your session, icon only. It switches right after Bing publishes, at the market's own midnight.
 - **Self-update** — Unbing checks GitHub releases on startup (and once a day while running) and updates itself in one click. Can be turned off.
@@ -83,6 +83,8 @@ until Bing has published a new picture.
 
 macOS keeps one wallpaper per Space. While the daily change is on, a Space that still shows an older
 Unbing picture gets today's as soon as you switch to it; wallpapers you picked yourself are left alone.
+To have the same picture everywhere right away, turn on **System Settings → Wallpaper → Show on all
+Spaces**.
 </details>
 
 <details>
@@ -163,7 +165,7 @@ On Linux and Windows, use <kbd>Ctrl</kbd> instead of <kbd>⌘</kbd>.
 
 ```toml
 market = "fr-FR"
-uhd = false
+resolution = "4k"      # or "1080p"
 history_limit = 30      # pictures kept on disk; the current wallpaper is never deleted
 auto_apply = true
 linux_backend = "auto"

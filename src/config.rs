@@ -27,6 +27,21 @@ pub enum ConfigError {
     Serialize(#[from] toml::ser::Error),
 }
 
+/// Size of the downloaded pictures.
+///
+/// Stored as `resolution`; the older `uhd = false` key (written by default by the first
+/// versions, hence not a real choice) is ignored, so those settings move to 4K.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Resolution {
+    /// 3840×2160: sharp on Retina / 4K screens (a few MB per picture).
+    #[default]
+    #[serde(rename = "4k")]
+    Uhd,
+    /// 1920×1080: lighter, enough for a 1080p screen.
+    #[serde(rename = "1080p")]
+    Hd,
+}
+
 /// Look of the interface.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -43,8 +58,8 @@ pub enum Theme {
 pub struct Config {
     /// Bing market (`fr-FR`, `en-US`…): the picture of the day differs per market.
     pub market: String,
-    /// Download the 4K version (`_UHD`) instead of 1920x1080.
-    pub uhd: bool,
+    /// `4k` (default) or `1080p`.
+    pub resolution: Resolution,
     /// Pictures kept in the local folder.
     pub history_limit: usize,
     /// Apply the picture of the day automatically (app, `--apply`, `--daemon`).
@@ -63,7 +78,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             market: "fr-FR".to_owned(),
-            uhd: false,
+            resolution: Resolution::Uhd,
             history_limit: 30,
             auto_apply: true,
             linux_backend: "auto".to_owned(),
@@ -129,6 +144,11 @@ impl Config {
         self
     }
 
+    /// Download the 4K (`_UHD`) version?
+    pub fn uhd(&self) -> bool {
+        self.resolution == Resolution::Uhd
+    }
+
     /// Folder where the pictures are kept.
     pub fn images_dir(&self) -> Result<PathBuf, ConfigError> {
         if let Some(dir) = &self.images_dir {
@@ -173,7 +193,7 @@ mod tests {
     fn defaults() {
         let c = Config::default();
         assert_eq!(c.market, "fr-FR");
-        assert!(!c.uhd);
+        assert!(c.uhd(), "4K by default");
         assert_eq!(c.history_limit, 30);
         assert!(c.auto_apply);
     }
@@ -182,15 +202,24 @@ mod tests {
     fn roundtrip_and_partial_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        let cfg = Config { market: "en-US".into(), uhd: true, history_limit: 12, ..Config::default() };
+        let cfg = Config { market: "en-US".into(), resolution: Resolution::Hd, history_limit: 12, ..Config::default() };
         cfg.save_to(&path).unwrap();
         assert_eq!(Config::load_from(&path), cfg);
 
         // A partial file is completed with defaults.
-        fs::write(&path, "uhd = true\n").unwrap();
+        fs::write(&path, "resolution = \"1080p\"\n").unwrap();
         let partial = Config::load_from(&path);
-        assert!(partial.uhd);
+        assert_eq!(partial.resolution, Resolution::Hd);
         assert_eq!(partial.market, "fr-FR");
+    }
+
+    #[test]
+    fn old_default_moves_to_4k() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Written as-is by the first versions, without the user choosing it.
+        fs::write(&path, "market = \"fr-FR\"\nuhd = false\nhistory_limit = 30\n").unwrap();
+        assert!(Config::load_from(&path).uhd());
     }
 
     #[test]
